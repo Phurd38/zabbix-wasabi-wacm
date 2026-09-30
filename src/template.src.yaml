@@ -1,0 +1,1569 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: '@@group|Templates/Cloud@@'
+      name: 'Templates/Cloud'
+  templates:
+    - uuid: '@@template|Wasabi WACM Connect by HTTP@@'
+      template: 'Wasabi WACM Connect by HTTP'
+      name: 'Wasabi WACM Connect by HTTP'
+      description: |
+        Supervision d'un parc Wasabi gere dans WACM (Wasabi Account Control Manager)
+        via la WACM Connect API : tous les sous-comptes et tous leurs buckets.
+
+        API : https://api.wacm.wasabisys.com
+          GET /api/v1/sub-accounts/
+          GET /api/v1/sub-accounts/{id}/buckets
+
+        Authentification : HTTP Basic.
+          - Cle utilisateur : identifiant = login WACM, mot de passe = cle API
+            (Mon profil > WACM Connect)
+          - Cle de compte  : identifiant = nom du compte, mot de passe = cle API
+            (onglet Account, role Account Admin requis)
+
+        NOTE : l'endpoint /utilizations n'existe pas dans WACM Connect (404).
+        Les metriques au niveau du compte proviennent de /sub-accounts.
+
+        UNITES renvoyees par l'API (converties en octets par preprocessing) :
+          activeStorage, deletedStorage, storageWrote, storageRead -> To
+          egress, ingress                                          -> Go
+        La conversion utilise le To decimal (1 To = 10^12 octets), comme la
+        facturation Wasabi. storageWrote et storageRead sont supposes en To :
+        valeurs nulles lors de la mise au point, unite non recoupee.
+
+        QUOTA : purchasedStorageTB pour un compte payant, trialQuotaTB pour un
+        compte en essai. L'item "Quota source" indique lequel s'applique.
+
+        NOMBRE D'APPELS : 1 appel pour la liste des sous-comptes, puis 1 appel
+        par sous-compte pour ses buckets. Utilisez {$WASABI.SUBACCOUNT.STATUS}
+        pour ecarter les comptes inactifs et rester sous le timeout de 60 s.
+        L'item "Collection duration" et le drapeau "Sub-account list truncated"
+        signalent une collecte qui approche de ses limites.
+
+        Prerequis :
+          1. Renseigner {$WASABI.WACM.USER} et {$WASABI.WACM.KEY} sur l'hote.
+          2. Le serveur ou proxy Zabbix doit joindre https://api.wacm.wasabisys.com.
+          3. Zabbix >= 7.0 (grille de dashboard a 72 colonnes).
+      vendor:
+        name: Community
+        version: 7.0-2
+      groups:
+        - name: 'Templates/Cloud'
+      items:
+        - uuid: '@@item|wasabi.wacm.get@@'
+          name: 'Wasabi: Get WACM data'
+          type: SCRIPT
+          key: wasabi.wacm.get
+          delay: 1h
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+          params: |
+            @@INJECT:src/collect.js@@
+          timeout: 60s
+          parameters:
+            - name: username
+              value: '{$WASABI.WACM.USER}'
+            - name: api_key
+              value: '{$WASABI.WACM.KEY}'
+            - name: base_url
+              value: '{$WASABI.WACM.URL}'
+            - name: max_accounts
+              value: '{$WASABI.SUBACCOUNT.MAX}'
+            - name: status_filter
+              value: '{$WASABI.SUBACCOUNT.STATUS}'
+            - name: include_deleted
+              value: '{$WASABI.SUBACCOUNT.INCLUDE_DELETED}'
+            - name: proxy
+              value: '{$WASABI.HTTP.PROXY}'
+          description: |
+            Item maitre. Recupere la liste des sous-comptes puis les buckets de
+            chacun, et renvoie un JSON unique dont derivent tous les autres items.
+          tags:
+            - tag: component
+              value: raw
+
+        - uuid: '@@item|wasabi.wacm.accounts.count@@'
+          name: 'Wasabi: Number of sub-accounts'
+          type: DEPENDENT
+          key: wasabi.wacm.accounts.count
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.wacm.get
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account_count
+              error_handler: DISCARD_VALUE
+          description: 'Sous-comptes reellement collectes.'
+          tags:
+            - tag: component
+              value: inventory
+
+        - uuid: '@@item|wasabi.wacm.accounts.total@@'
+          name: 'Wasabi: Number of sub-accounts reported by the API'
+          type: DEPENDENT
+          key: wasabi.wacm.accounts.total
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.wacm.get
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.accounts_total
+              error_handler: DISCARD_VALUE
+          description: |
+            Total annonce par l'API, avant tout filtre et tout plafonnement.
+            Sert de reference pour detecter une troncature ou l'apparition
+            d'un nouveau compte.
+          tags:
+            - tag: component
+              value: inventory
+
+        - uuid: '@@item|wasabi.wacm.accounts.eligible@@'
+          name: 'Wasabi: Number of sub-accounts eligible for collection'
+          type: DEPENDENT
+          key: wasabi.wacm.accounts.eligible
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.wacm.get
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.accounts_eligible
+              error_handler: DISCARD_VALUE
+          description: |
+            Comptes retenus apres le filtre de statut, avant plafonnement par
+            {$WASABI.SUBACCOUNT.MAX}. Un ecart avec le nombre collecte signifie
+            que des comptes ne sont plus supervises.
+          tags:
+            - tag: component
+              value: inventory
+
+        - uuid: '@@item|wasabi.wacm.truncated@@'
+          name: 'Wasabi: Sub-account list truncated'
+          type: DEPENDENT
+          key: wasabi.wacm.truncated
+          delay: '0'
+          value_type: UNSIGNED
+          valuemap:
+            name: 'Yes/No'
+          master_item:
+            key: wasabi.wacm.get
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.truncated
+              error_handler: DISCARD_VALUE
+          description: |
+            A 1, des sous-comptes eligibles n'ont pas ete collectes parce que
+            {$WASABI.SUBACCOUNT.MAX} a ete atteint. Leurs items finiront par etre
+            supprimes par la decouverte, avec leur historique.
+          tags:
+            - tag: component
+              value: health
+
+        - uuid: '@@item|wasabi.wacm.duration@@'
+          name: 'Wasabi: Collection duration'
+          type: DEPENDENT
+          key: wasabi.wacm.duration
+          delay: '0'
+          value_type: FLOAT
+          units: s
+          master_item:
+            key: wasabi.wacm.get
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.duration_s
+              error_handler: DISCARD_VALUE
+          description: |
+            Duree totale de la collecte. Le timeout de l'item maitre est de 60 s :
+            au-dela de 45 s, il faut filtrer les comptes inactifs.
+          tags:
+            - tag: component
+              value: health
+
+        - uuid: '@@item|wasabi.wacm.buckets.count@@'
+          name: 'Wasabi: Number of buckets, all sub-accounts'
+          type: DEPENDENT
+          key: wasabi.wacm.buckets.count
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.wacm.get
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.bucket_count
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: inventory
+
+        - uuid: '@@item|wasabi.total.storage.active@@'
+          name: 'Wasabi: Total active storage, all sub-accounts'
+          type: CALCULATED
+          key: wasabi.total.storage.active
+          delay: 1h
+          value_type: FLOAT
+          units: B
+          params: 'sum(last_foreach(//wasabi.sub.storage.active[*]))'
+          tags:
+            - tag: component
+              value: aggregate
+
+        - uuid: '@@item|wasabi.total.storage.deleted@@'
+          name: 'Wasabi: Total deleted storage, all sub-accounts'
+          type: CALCULATED
+          key: wasabi.total.storage.deleted
+          delay: 1h
+          value_type: FLOAT
+          units: B
+          params: 'sum(last_foreach(//wasabi.sub.storage.deleted[*]))'
+          tags:
+            - tag: component
+              value: aggregate
+
+        - uuid: '@@item|wasabi.total.storage.quota@@'
+          name: 'Wasabi: Total quota sold, all sub-accounts'
+          type: CALCULATED
+          key: wasabi.total.storage.quota
+          delay: 1h
+          value_type: FLOAT
+          units: B
+          params: 'sum(last_foreach(//wasabi.sub.quota.effective[*]))'
+          tags:
+            - tag: component
+              value: aggregate
+
+        - uuid: '@@item|wasabi.total.quota.pct@@'
+          name: 'Wasabi: Overall quota usage'
+          type: CALCULATED
+          key: wasabi.total.quota.pct
+          delay: 1h
+          value_type: FLOAT
+          units: '%'
+          params: '100*last(//wasabi.total.storage.active)/(last(//wasabi.total.storage.quota)+1)'
+          description: 'Taux d''occupation du parc : stockage utilise sur quota vendu.'
+          tags:
+            - tag: component
+              value: aggregate
+
+        - uuid: '@@item|wasabi.total.deleted.pct@@'
+          name: 'Wasabi: Deleted storage ratio, all sub-accounts'
+          type: CALCULATED
+          key: wasabi.total.deleted.pct
+          delay: 1h
+          value_type: FLOAT
+          units: '%'
+          params: '100*last(//wasabi.total.storage.deleted)/(last(//wasabi.total.storage.active)+1)'
+          description: |
+            Part du parc facturee au titre de la retention 90 jours sur des donnees
+            deja supprimees.
+          tags:
+            - tag: component
+              value: aggregate
+
+        - uuid: '@@item|wasabi.total.egress.30d@@'
+          name: 'Wasabi: Total egress, 30d'
+          type: CALCULATED
+          key: wasabi.total.egress.30d
+          delay: 1h
+          value_type: FLOAT
+          units: B
+          params: 'sum(last_foreach(//wasabi.sub.egress.30d[*]))'
+          tags:
+            - tag: component
+              value: aggregate
+
+      discovery_rules:
+        - uuid: '@@lld|wasabi.wacm.subaccounts.discovery@@'
+          name: 'Wasabi: Sub-account discovery'
+          type: DEPENDENT
+          key: wasabi.wacm.subaccounts.discovery
+          delay: '0'
+          filter:
+            evaltype: AND
+            conditions:
+              - macro: '{#SUBNAME}'
+                value: '{$WASABI.SUBACCOUNT.MATCHES}'
+                formulaid: A
+              - macro: '{#SUBNAME}'
+                value: '{$WASABI.SUBACCOUNT.NOT_MATCHES}'
+                operator: NOT_MATCHES_REGEX
+                formulaid: B
+          lifetime: 7d
+          master_item:
+            key: wasabi.wacm.get
+          description: 'Decouvre les sous-comptes WACM visibles par la cle API.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.discovery_accounts
+          item_prototypes:
+            - uuid: '@@proto|wasabi.sub.storage.active["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Active storage'
+              type: DEPENDENT
+              key: 'wasabi.sub.storage.active["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].activeStorage
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000000'
+              description: 'Renvoye en To par l''API, converti en octets (1 To = 10^12).'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: storage
+
+            - uuid: '@@proto|wasabi.sub.storage.deleted["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Deleted storage'
+              type: DEPENDENT
+              key: 'wasabi.sub.storage.deleted["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].deletedStorage
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000000'
+              description: |
+                Objets supprimes encore factures au titre de la retention minimale
+                de 90 jours.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: storage
+
+            - uuid: '@@proto|wasabi.sub.storage.purchased["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Purchased storage'
+              type: DEPENDENT
+              key: 'wasabi.sub.storage.purchased["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].purchasedStorageTB
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000000'
+              description: 'Vide pour un compte en essai : voir "Effective quota".'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: quota
+
+            - uuid: '@@proto|wasabi.sub.quota.effective["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Effective quota'
+              type: DEPENDENT
+              key: 'wasabi.sub.quota.effective["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].quota_tb
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000000'
+              description: |
+                Quota reellement applicable : purchasedStorageTB pour un compte
+                payant, trialQuotaTB pour un compte en essai.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: quota
+
+            - uuid: '@@proto|wasabi.sub.quota.source["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Quota source'
+              type: DEPENDENT
+              key: 'wasabi.sub.quota.source["{#SUBID}"]'
+              delay: '0'
+              history: 30d
+              trends: '0'
+              value_type: CHAR
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].quota_source
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              description: |
+                purchased = quota souscrit, trial = quota d'essai,
+                none = aucun quota defini, le taux d'occupation est alors sans objet.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: quota
+
+            - uuid: '@@proto|wasabi.sub.quota.pct["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Quota usage'
+              type: DEPENDENT
+              key: 'wasabi.sub.quota.pct["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: '%'
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].quota_pct
+                  error_handler: DISCARD_VALUE
+              description: |
+                Stockage actif rapporte au quota effectif, qu'il soit souscrit
+                ou d'essai. Sans valeur si aucun quota n'est defini.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: quota
+
+            - uuid: '@@proto|wasabi.sub.trial.days["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Trial days remaining'
+              type: DEPENDENT
+              key: 'wasabi.sub.trial.days["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].trial_days_left
+                  error_handler: DISCARD_VALUE
+              description: |
+                Jours restants avant expiration de la periode d'essai.
+                Aucune valeur si le compte n'est pas en essai.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: lifecycle
+
+            - uuid: '@@proto|wasabi.sub.status["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Status'
+              type: DEPENDENT
+              key: 'wasabi.sub.status["{#SUBID}"]'
+              delay: '0'
+              history: 30d
+              trends: '0'
+              value_type: CHAR
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].status
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              description: 'ON_TRIAL, PAID_ACCOUNT, SUSPENDED, DEACTIVATED, PENDING_DELETION.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: lifecycle
+
+            - uuid: '@@proto|wasabi.sub.quota.type["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Quota type'
+              type: DEPENDENT
+              key: 'wasabi.sub.quota.type["{#SUBID}"]'
+              delay: '0'
+              history: 30d
+              trends: '0'
+              value_type: CHAR
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].storageQuotaType
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              description: 'Soft quota = depassement autorise. Hard quota = ecritures bloquees.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: quota
+
+            - uuid: '@@proto|wasabi.sub.deletion["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Time until deletion'
+              type: DEPENDENT
+              key: 'wasabi.sub.deletion["{#SUBID}"]'
+              delay: '0'
+              history: 30d
+              trends: '0'
+              value_type: CHAR
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].timeUntilDeletion
+                  error_handler: CUSTOM_VALUE
+                  error_handler_params: ''
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              description: 'Non vide uniquement lorsque le compte est en PENDING_DELETION.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: lifecycle
+
+            - uuid: '@@proto|wasabi.sub.mfa["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: MFA enabled'
+              type: DEPENDENT
+              key: 'wasabi.sub.mfa["{#SUBID}"]'
+              delay: '0'
+              value_type: UNSIGNED
+              valuemap:
+                name: 'Enabled/Disabled'
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].mfa
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: security
+
+            - uuid: '@@proto|wasabi.sub.sso["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: SSO enabled'
+              type: DEPENDENT
+              key: 'wasabi.sub.sso["{#SUBID}"]'
+              delay: '0'
+              value_type: UNSIGNED
+              valuemap:
+                name: 'Enabled/Disabled'
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].sso
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: security
+
+            - uuid: '@@proto|wasabi.sub.ftp["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: FTP enabled'
+              type: DEPENDENT
+              key: 'wasabi.sub.ftp["{#SUBID}"]'
+              delay: '0'
+              value_type: UNSIGNED
+              valuemap:
+                name: 'Enabled/Disabled'
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].ftp
+                  error_handler: DISCARD_VALUE
+              description: 'L''acces FTP elargit la surface d''exposition du compte.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: security
+
+            - uuid: '@@proto|wasabi.sub.buckets.count["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Number of buckets'
+              type: DEPENDENT
+              key: 'wasabi.sub.buckets.count["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].bucket_count
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: inventory
+
+            - uuid: '@@proto|wasabi.sub.egress["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Egress per day'
+              type: DEPENDENT
+              key: 'wasabi.sub.egress["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].egress
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000'
+              description: 'Somme de l''egress des buckets du compte. Total journalier.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: network
+
+            - uuid: '@@proto|wasabi.sub.ingress["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Ingress per day'
+              type: DEPENDENT
+              key: 'wasabi.sub.ingress["{#SUBID}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.accounts['{#SUBID}'].ingress
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: network
+
+            - uuid: '@@proto|wasabi.sub.egress.30d["{#SUBID}"]@@'
+              name: 'Sub-account [{#SUBNAME}]: Egress, 30d'
+              type: CALCULATED
+              key: 'wasabi.sub.egress.30d["{#SUBID}"]'
+              delay: 1h
+              value_type: FLOAT
+              units: B
+              params: 'sum(//wasabi.sub.egress["{#SUBID}"],30d)'
+              description: |
+                Egress cumule sur 30 jours. La politique d'usage raisonnable de
+                Wasabi attend un egress mensuel inferieur au volume stocke.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: component
+                  value: network
+
+          trigger_prototypes:
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: Storage quota exceeded (>={$WASABI.QUOTA.CRIT}%)@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.quota.pct["{#SUBID}"])>={$WASABI.QUOTA.CRIT}'
+              name: 'Sub-account [{#SUBNAME}]: Storage quota exceeded (>={$WASABI.QUOTA.CRIT}%)'
+              priority: AVERAGE
+              description: |
+                Le quota applicable est depasse. En Soft quota rien n'est bloque mais
+                le depassement est facture ; en Hard quota les ecritures sont refusees.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: capacity
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: Storage quota above {$WASABI.QUOTA.HIGH}%@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.quota.pct["{#SUBID}"])>={$WASABI.QUOTA.HIGH}'
+              name: 'Sub-account [{#SUBNAME}]: Storage quota above {$WASABI.QUOTA.HIGH}%'
+              priority: WARNING
+              dependencies:
+                - name: 'Sub-account [{#SUBNAME}]: Storage quota exceeded (>={$WASABI.QUOTA.CRIT}%)'
+                  expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.quota.pct["{#SUBID}"])>={$WASABI.QUOTA.CRIT}'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: capacity
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: Storage quota above {$WASABI.QUOTA.WARN}%@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.quota.pct["{#SUBID}"])>={$WASABI.QUOTA.WARN}'
+              name: 'Sub-account [{#SUBNAME}]: Storage quota above {$WASABI.QUOTA.WARN}%'
+              priority: INFO
+              dependencies:
+                - name: 'Sub-account [{#SUBNAME}]: Storage quota above {$WASABI.QUOTA.HIGH}%'
+                  expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.quota.pct["{#SUBID}"])>={$WASABI.QUOTA.HIGH}'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: capacity
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: No quota defined@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.quota.source["{#SUBID}"])="none"'
+              name: 'Sub-account [{#SUBNAME}]: No quota defined'
+              priority: INFO
+              manual_close: 'YES'
+              description: |
+                Ni quota souscrit ni quota d'essai : aucune surveillance de
+                capacite n'est possible sur ce compte.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: capacity
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: Trial expires in less than {$WASABI.TRIAL.DAYS.WARN} days@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.trial.days["{#SUBID}"])<={$WASABI.TRIAL.DAYS.WARN} and last(/Wasabi WACM Connect by HTTP/wasabi.sub.trial.days["{#SUBID}"])>=0'
+              name: 'Sub-account [{#SUBNAME}]: Trial expires in less than {$WASABI.TRIAL.DAYS.WARN} days'
+              priority: WARNING
+              description: |
+                La periode d'essai touche a sa fin. Sans conversion en compte payant,
+                le service sera interrompu.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: lifecycle
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: Trial has expired@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.trial.days["{#SUBID}"])<0'
+              name: 'Sub-account [{#SUBNAME}]: Trial has expired'
+              priority: AVERAGE
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: lifecycle
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: Pending deletion@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.status["{#SUBID}"])="PENDING_DELETION"'
+              name: 'Sub-account [{#SUBNAME}]: Pending deletion'
+              priority: HIGH
+              manual_close: 'YES'
+              description: |
+                Le sous-compte va etre supprime, ainsi que toutes ses donnees.
+                Verifier que la suppression est bien intentionnelle.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: lifecycle
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: Suspended@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.status["{#SUBID}"])="SUSPENDED"'
+              name: 'Sub-account [{#SUBNAME}]: Suspended'
+              priority: AVERAGE
+              description: 'Compte suspendu : acces aux donnees interrompu.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: lifecycle
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: MFA is disabled@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.mfa["{#SUBID}"])=0 and {$WASABI.MFA.ALERT}=1'
+              name: 'Sub-account [{#SUBNAME}]: MFA is disabled'
+              priority: INFO
+              description: |
+                Authentification multifacteur desactivee sur ce sous-compte.
+                Mettre {$WASABI.MFA.ALERT} a 0 pour desactiver ce controle.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: security
+
+            - uuid: '@@trigger|Sub-account [{#SUBNAME}]: 30d egress exceeds stored volume@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.sub.egress.30d["{#SUBID}"])>last(/Wasabi WACM Connect by HTTP/wasabi.sub.storage.active["{#SUBID}"])'
+              name: 'Sub-account [{#SUBNAME}]: 30d egress exceeds stored volume'
+              priority: WARNING
+              manual_close: 'YES'
+              description: |
+                L'egress cumule sur 30 jours depasse le volume stocke. La politique
+                d'usage raisonnable de Wasabi attend un ratio inferieur ou egal a 1.
+                Les items "Egress, 30d" par bucket permettent d'identifier la source.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: scope
+                  value: cost
+
+          graph_prototypes:
+            - uuid: '@@gproto|Sub-account [{#SUBNAME}]: Storage vs quota@@'
+              name: 'Sub-account [{#SUBNAME}]: Storage vs quota'
+              graph_items:
+                - color: 1A7C11
+                  item:
+                    host: 'Wasabi WACM Connect by HTTP'
+                    key: 'wasabi.sub.storage.active["{#SUBID}"]'
+                - sortorder: '1'
+                  color: F63100
+                  item:
+                    host: 'Wasabi WACM Connect by HTTP'
+                    key: 'wasabi.sub.storage.deleted["{#SUBID}"]'
+                - sortorder: '2'
+                  color: 2774A4
+                  drawtype: BOLD_LINE
+                  item:
+                    host: 'Wasabi WACM Connect by HTTP'
+                    key: 'wasabi.sub.quota.effective["{#SUBID}"]'
+
+        - uuid: '@@lld|wasabi.wacm.buckets.discovery@@'
+          name: 'Wasabi: Bucket discovery'
+          type: DEPENDENT
+          key: wasabi.wacm.buckets.discovery
+          delay: '0'
+          filter:
+            evaltype: AND
+            conditions:
+              - macro: '{#BUCKET}'
+                value: '{$WASABI.BUCKET.MATCHES}'
+                formulaid: A
+              - macro: '{#BUCKET}'
+                value: '{$WASABI.BUCKET.NOT_MATCHES}'
+                operator: NOT_MATCHES_REGEX
+                formulaid: B
+          lifetime: 7d
+          master_item:
+            key: wasabi.wacm.get
+          description: |
+            Decouvre tous les buckets de tous les sous-comptes.
+            Zabbix ne gere pas la decouverte imbriquee : la cle de chaque item
+            porte donc l'identifiant du sous-compte ET le nom du bucket.
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.discovery_buckets
+          item_prototypes:
+            - uuid: '@@proto|wasabi.bucket.storage.active["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Active storage'
+              type: DEPENDENT
+              key: 'wasabi.bucket.storage.active["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].activeStorage
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000000'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: storage
+
+            - uuid: '@@proto|wasabi.bucket.storage.deleted["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Deleted storage'
+              type: DEPENDENT
+              key: 'wasabi.bucket.storage.deleted["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].deletedStorage
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000000'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: storage
+
+            - uuid: '@@proto|wasabi.bucket.storage.wrote["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Storage written'
+              type: DEPENDENT
+              key: 'wasabi.bucket.storage.wrote["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].storageWrote
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000000'
+              description: 'Unite supposee To, non recoupee sur des donnees reelles.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: storage
+
+            - uuid: '@@proto|wasabi.bucket.storage.read["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Storage read'
+              type: DEPENDENT
+              key: 'wasabi.bucket.storage.read["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].storageRead
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000000'
+              description: 'Unite supposee To, non recoupee sur des donnees reelles.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: storage
+
+            - uuid: '@@proto|wasabi.bucket.objects.active["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Active objects'
+              type: DEPENDENT
+              key: 'wasabi.bucket.objects.active["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].activeObjects
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: objects
+
+            - uuid: '@@proto|wasabi.bucket.objects.deleted["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Deleted objects'
+              type: DEPENDENT
+              key: 'wasabi.bucket.objects.deleted["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].deletedObjects
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: objects
+
+            - uuid: '@@proto|wasabi.bucket.egress["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Egress per day'
+              type: DEPENDENT
+              key: 'wasabi.bucket.egress["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].egress
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000'
+              description: 'Renvoye en Go par l''API, converti en octets. Total journalier.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: network
+
+            - uuid: '@@proto|wasabi.bucket.egress.30d["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Egress, 30d'
+              type: CALCULATED
+              key: 'wasabi.bucket.egress.30d["{#SUBID}","{#BUCKET}"]'
+              delay: 1h
+              value_type: FLOAT
+              units: B
+              params: 'sum(//wasabi.bucket.egress["{#SUBID}","{#BUCKET}"],30d)'
+              description: |
+                Egress cumule sur 30 jours. Sert a identifier quel bucket est a
+                l'origine d'un depassement au niveau du compte.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: network
+
+            - uuid: '@@proto|wasabi.bucket.ingress["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Ingress per day'
+              type: DEPENDENT
+              key: 'wasabi.bucket.ingress["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].ingress
+                  error_handler: DISCARD_VALUE
+                - type: MULTIPLIER
+                  parameters:
+                    - '1000000000'
+              description: 'Renvoye en Go par l''API, converti en octets. Total journalier.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: network
+
+            - uuid: '@@proto|wasabi.bucket.apicalls["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: API calls per day'
+              type: DEPENDENT
+              key: 'wasabi.bucket.apicalls["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].apiCalls
+                  error_handler: DISCARD_VALUE
+              description: 'Total journalier, PAS un compteur monotone.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: api
+
+            - uuid: '@@proto|wasabi.bucket.region["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Region'
+              type: DEPENDENT
+              key: 'wasabi.bucket.region["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              history: 30d
+              trends: '0'
+              value_type: CHAR
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].region
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: inventory
+
+            - uuid: '@@proto|wasabi.bucket.is_deleted["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Deleted'
+              type: DEPENDENT
+              key: 'wasabi.bucket.is_deleted["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: UNSIGNED
+              valuemap:
+                name: 'Yes/No'
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].is_deleted
+                  error_handler: DISCARD_VALUE
+              description: 'Le bucket a ete supprime mais reste facture le temps de la retention.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: lifecycle
+
+            - uuid: '@@proto|wasabi.bucket.delete_time["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Deletion date'
+              type: DEPENDENT
+              key: 'wasabi.bucket.delete_time["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              history: 30d
+              trends: '0'
+              value_type: CHAR
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].delete_time
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: lifecycle
+
+            - uuid: '@@proto|wasabi.bucket.data_age["{#SUBID}","{#BUCKET}"]@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Utilization data age'
+              type: DEPENDENT
+              key: 'wasabi.bucket.data_age["{#SUBID}","{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: s
+              master_item:
+                key: wasabi.wacm.get
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#SUBID}/{#BUCKET}'].age_seconds
+                  error_handler: DISCARD_VALUE
+              description: 'Ecart entre maintenant et le champ endTime du releve.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: health
+
+          trigger_prototypes:
+            - uuid: '@@trigger|Bucket [{#SUBNAME}/{#BUCKET}]: Storage size is too high@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.bucket.storage.active["{#SUBID}","{#BUCKET}"])>{$WASABI.BUCKET.STORAGE.MAX:"{#BUCKET}"}'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Storage size is too high'
+              priority: WARNING
+              description: |
+                Seuil surchargeable par bucket via un contexte de macro :
+                {$WASABI.BUCKET.STORAGE.MAX:"nom-du-bucket"} = 5T
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: scope
+                  value: capacity
+
+            - uuid: '@@trigger|Bucket [{#SUBNAME}/{#BUCKET}]: Storage dropped by more than {$WASABI.BUCKET.DROP.PCT}%@@'
+              expression: 'change(/Wasabi WACM Connect by HTTP/wasabi.bucket.storage.active["{#SUBID}","{#BUCKET}"])<0 and abs(change(/Wasabi WACM Connect by HTTP/wasabi.bucket.storage.active["{#SUBID}","{#BUCKET}"]))>last(/Wasabi WACM Connect by HTTP/wasabi.bucket.storage.active["{#SUBID}","{#BUCKET}"],#2)*{$WASABI.BUCKET.DROP.PCT}/100'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Storage dropped by more than {$WASABI.BUCKET.DROP.PCT}%'
+              priority: AVERAGE
+              manual_close: 'YES'
+              description: |
+                Chute brutale du volume : suppression massive, lifecycle mal regle
+                ou compromission. A verifier.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: scope
+                  value: security
+
+            - uuid: '@@trigger|Bucket [{#SUBNAME}/{#BUCKET}]: Deleted but still billed@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.bucket.is_deleted["{#SUBID}","{#BUCKET}"])=1 and last(/Wasabi WACM Connect by HTTP/wasabi.bucket.storage.deleted["{#SUBID}","{#BUCKET}"])>{$WASABI.DELETED.BILLED.MIN}'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Deleted but still billed'
+              priority: INFO
+              manual_close: 'YES'
+              description: |
+                Le bucket est supprime mais son contenu reste facture au titre de la
+                retention minimale de 90 jours. L'alerte disparaitra d'elle-meme a
+                l'issue de cette periode.
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: scope
+                  value: cost
+
+            - uuid: '@@trigger|Bucket [{#SUBNAME}/{#BUCKET}]: Utilization data is stale@@'
+              expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.bucket.data_age["{#SUBID}","{#BUCKET}"])>{$WASABI.DATA.MAX_AGE}'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Utilization data is stale'
+              priority: WARNING
+              description: 'Aucun nouveau releve depuis {$WASABI.DATA.MAX_AGE}.'
+              tags:
+                - tag: subaccount
+                  value: '{#SUBNAME}'
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: scope
+                  value: availability
+
+          graph_prototypes:
+            - uuid: '@@gproto|Bucket [{#SUBNAME}/{#BUCKET}]: Storage@@'
+              name: 'Bucket [{#SUBNAME}/{#BUCKET}]: Storage'
+              graph_items:
+                - color: 1A7C11
+                  item:
+                    host: 'Wasabi WACM Connect by HTTP'
+                    key: 'wasabi.bucket.storage.active["{#SUBID}","{#BUCKET}"]'
+                - sortorder: '1'
+                  color: F63100
+                  item:
+                    host: 'Wasabi WACM Connect by HTTP'
+                    key: 'wasabi.bucket.storage.deleted["{#SUBID}","{#BUCKET}"]'
+
+      dashboards:
+        - uuid: '@@dash|Wasabi overview@@'
+          name: 'Wasabi overview'
+          pages:
+            - widgets:
+                - type: item
+                  name: 'Stockage actif du parc'
+                  width: '18'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid
+                      value:
+                        host: 'Wasabi WACM Connect by HTTP'
+                        key: wasabi.total.storage.active
+                - type: item
+                  name: 'Stockage supprime facture'
+                  x: '18'
+                  width: '18'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid
+                      value:
+                        host: 'Wasabi WACM Connect by HTTP'
+                        key: wasabi.total.storage.deleted
+                - type: item
+                  name: 'Occupation du quota vendu'
+                  x: '36'
+                  width: '18'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid
+                      value:
+                        host: 'Wasabi WACM Connect by HTTP'
+                        key: wasabi.total.quota.pct
+                - type: item
+                  name: 'Sous-comptes'
+                  x: '54'
+                  width: '18'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid
+                      value:
+                        host: 'Wasabi WACM Connect by HTTP'
+                        key: wasabi.wacm.accounts.count
+                - type: item
+                  name: 'Buckets'
+                  'y': '3'
+                  width: '18'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid
+                      value:
+                        host: 'Wasabi WACM Connect by HTTP'
+                        key: wasabi.wacm.buckets.count
+                - type: item
+                  name: 'Part de donnees supprimees'
+                  x: '18'
+                  'y': '3'
+                  width: '18'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid
+                      value:
+                        host: 'Wasabi WACM Connect by HTTP'
+                        key: wasabi.total.deleted.pct
+                - type: item
+                  name: 'Egress 30 jours'
+                  x: '36'
+                  'y': '3'
+                  width: '18'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid
+                      value:
+                        host: 'Wasabi WACM Connect by HTTP'
+                        key: wasabi.total.egress.30d
+                - type: item
+                  name: 'Duree de collecte'
+                  x: '54'
+                  'y': '3'
+                  width: '18'
+                  height: '3'
+                  fields:
+                    - type: ITEM
+                      name: itemid
+                      value:
+                        host: 'Wasabi WACM Connect by HTTP'
+                        key: wasabi.wacm.duration
+                - type: problems
+                  name: 'Problemes en cours'
+                  'y': '6'
+                  width: '72'
+                  height: '8'
+
+      tags:
+        - tag: class
+          value: cloud
+        - tag: target
+          value: wasabi
+
+      macros:
+        - macro: '{$WASABI.WACM.USER}'
+          description: |
+            Identifiant HTTP Basic. Pour une cle utilisateur : votre login WACM
+            (ex. prenom.nom@societe.fr). Pour une cle de compte : le nom du compte.
+            Ce n'est JAMAIS le nom donne a la cle.
+        - macro: '{$WASABI.WACM.KEY}'
+          type: SECRET_TEXT
+          description: 'Cle API WACM Connect.'
+        - macro: '{$WASABI.WACM.URL}'
+          value: 'https://api.wacm.wasabisys.com'
+          description: 'URL de base de la WACM Connect API.'
+        - macro: '{$WASABI.HTTP.PROXY}'
+          value: ''
+          description: 'Proxy HTTP sortant, ex. http://proxy.local:3128. Vide = pas de proxy.'
+        - macro: '{$WASABI.SUBACCOUNT.MAX}'
+          value: '50'
+          description: |
+            Nombre maximal de sous-comptes traites par collecte. Chaque sous-compte
+            coute un appel API supplementaire. Si ce plafond est atteint, l'item
+            "Sub-account list truncated" passe a 1 et un trigger se declenche :
+            des comptes ne sont alors plus supervises.
+        - macro: '{$WASABI.SUBACCOUNT.STATUS}'
+          value: ''
+          description: |
+            Filtre de statut applique AVANT la recuperation des buckets, pour
+            economiser des appels. Ex. : PAID_ACCOUNT,ON_TRIAL
+            Vide = tous les sous-comptes.
+        - macro: '{$WASABI.SUBACCOUNT.INCLUDE_DELETED}'
+          value: 'false'
+          description: 'Mettre a true pour inclure les sous-comptes supprimes.'
+        - macro: '{$WASABI.SUBACCOUNT.MATCHES}'
+          value: '.*'
+          description: 'LLD : ne decouvrir que les sous-comptes dont le nom correspond.'
+        - macro: '{$WASABI.SUBACCOUNT.NOT_MATCHES}'
+          value: 'CHANGE_IF_NEEDED'
+          description: 'LLD : ignorer les sous-comptes dont le nom correspond.'
+        - macro: '{$WASABI.BUCKET.MATCHES}'
+          value: '.*'
+          description: 'LLD : ne decouvrir que les buckets dont le nom correspond.'
+        - macro: '{$WASABI.BUCKET.NOT_MATCHES}'
+          value: 'CHANGE_IF_NEEDED'
+          description: 'LLD : ignorer les buckets dont le nom correspond.'
+        - macro: '{$WASABI.QUOTA.WARN}'
+          value: '75'
+          description: 'Premier seuil de quota (%), aligne sur les alertes WACM.'
+        - macro: '{$WASABI.QUOTA.HIGH}'
+          value: '90'
+          description: 'Deuxieme seuil de quota (%).'
+        - macro: '{$WASABI.QUOTA.CRIT}'
+          value: '100'
+          description: 'Quota depasse (%).'
+        - macro: '{$WASABI.TRIAL.DAYS.WARN}'
+          value: '7'
+          description: 'Alerter quand une periode d''essai expire dans moins de N jours.'
+        - macro: '{$WASABI.BUCKET.STORAGE.MAX}'
+          value: 10T
+          description: 'Seuil d''alerte de volume par bucket. Surchargeable par contexte.'
+        - macro: '{$WASABI.BUCKET.DROP.PCT}'
+          value: '20'
+          description: 'Pourcentage de chute de volume declenchant une alerte.'
+        - macro: '{$WASABI.DELETED.BILLED.MIN}'
+          value: 1G
+          description: |
+            Volume supprime minimal, sur un bucket lui-meme supprime, a partir
+            duquel on signale que la facturation continue.
+        - macro: '{$WASABI.DATA.MAX_AGE}'
+          value: 48h
+          description: 'Age maximal d''un releve avant alerte.'
+        - macro: '{$WASABI.MFA.ALERT}'
+          value: '1'
+          description: 'Mettre a 0 pour ne pas alerter sur les sous-comptes sans MFA.'
+        - macro: '{$WASABI.DURATION.MAX}'
+          value: '45'
+          description: |
+            Duree de collecte (s) au-dela de laquelle on alerte. Le timeout dur
+            de l'item maitre est de 60 s.
+
+      valuemaps:
+        - uuid: '@@vmap|Enabled/Disabled@@'
+          name: 'Enabled/Disabled'
+          mappings:
+            - value: '0'
+              newvalue: Disabled
+            - value: '1'
+              newvalue: Enabled
+        - uuid: '@@vmap|Yes/No@@'
+          name: 'Yes/No'
+          mappings:
+            - value: '0'
+              newvalue: 'No'
+            - value: '1'
+              newvalue: 'Yes'
+
+  triggers:
+    - uuid: '@@trigger|Wasabi: Failed to get data from the WACM Connect API@@'
+      expression: 'nodata(/Wasabi WACM Connect by HTTP/wasabi.wacm.get,3h)=1'
+      name: 'Wasabi: Failed to get data from the WACM Connect API'
+      priority: AVERAGE
+      description: |
+        Aucune donnee depuis 3h. Verifier :
+        - {$WASABI.WACM.USER} : c'est le LOGIN WACM, pas le nom de la cle ;
+        - {$WASABI.WACM.KEY} ;
+        - la joignabilite de https://api.wacm.wasabisys.com depuis Zabbix ;
+        - l'erreur exacte dans Latest data, item "Wasabi: Get WACM data".
+      tags:
+        - tag: scope
+          value: availability
+
+    - uuid: '@@trigger|Wasabi: No sub-account visible@@'
+      expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.wacm.accounts.count)=0'
+      name: 'Wasabi: No sub-account visible'
+      priority: WARNING
+      description: |
+        L'API repond mais ne renvoie aucun sous-compte. Portee de la cle trop
+        etroite, ou filtre {$WASABI.SUBACCOUNT.STATUS} trop restrictif.
+      tags:
+        - tag: scope
+          value: availability
+
+    - uuid: '@@trigger|Wasabi: Sub-account list is truncated - some accounts are not monitored@@'
+      expression: 'last(/Wasabi WACM Connect by HTTP/wasabi.wacm.truncated)=1'
+      name: 'Wasabi: Sub-account list is truncated - some accounts are not monitored'
+      priority: AVERAGE
+      description: |
+        Le plafond {$WASABI.SUBACCOUNT.MAX} a ete atteint : des sous-comptes
+        eligibles ne sont pas collectes. Leurs items seront supprimes par la
+        decouverte au bout de 7 jours, avec leur historique.
+
+        Comparer "Number of sub-accounts eligible for collection" et
+        "Number of sub-accounts" pour mesurer l'ecart, puis soit relever le
+        plafond, soit restreindre {$WASABI.SUBACCOUNT.STATUS}.
+      tags:
+        - tag: scope
+          value: availability
+
+    - uuid: '@@trigger|Wasabi: Collection is approaching the 60s timeout@@'
+      expression: 'min(/Wasabi WACM Connect by HTTP/wasabi.wacm.duration,3h)>{$WASABI.DURATION.MAX}'
+      name: 'Wasabi: Collection is approaching the 60s timeout'
+      priority: WARNING
+      description: |
+        La collecte depasse {$WASABI.DURATION.MAX} s de facon durable. Au-dela de
+        60 s l'item maitre echoue et toute la supervision Wasabi s'arrete.
+        Filtrer les comptes inactifs via {$WASABI.SUBACCOUNT.STATUS}.
+      tags:
+        - tag: scope
+          value: performance
+
+    - uuid: '@@trigger|Wasabi: A sub-account has been added@@'
+      expression: 'change(/Wasabi WACM Connect by HTTP/wasabi.wacm.accounts.total)>0'
+      name: 'Wasabi: A sub-account has been added'
+      priority: INFO
+      manual_close: 'YES'
+      description: |
+        Un ou plusieurs sous-comptes sont apparus dans WACM depuis la derniere
+        collecte. Information de suivi commercial, a acquitter manuellement.
+      tags:
+        - tag: scope
+          value: lifecycle
+
+    - uuid: '@@trigger|Wasabi: A sub-account has disappeared@@'
+      expression: 'change(/Wasabi WACM Connect by HTTP/wasabi.wacm.accounts.total)<0'
+      name: 'Wasabi: A sub-account has disappeared'
+      priority: WARNING
+      manual_close: 'YES'
+      description: |
+        Un ou plusieurs sous-comptes ne sont plus renvoyes par l'API : suppression
+        effective, ou perte de visibilite de la cle sur ces comptes.
+      tags:
+        - tag: scope
+          value: lifecycle

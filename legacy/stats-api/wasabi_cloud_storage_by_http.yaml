@@ -1,0 +1,1123 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+    - uuid: 2aeefb8933744ea6a798fc9435dc9baf
+      name: 'Templates/Cloud'
+  templates:
+    - uuid: a3a97cd8c16d42be95072b1a6c116038
+      template: 'Wasabi Cloud Storage by HTTP'
+      name: 'Wasabi Cloud Storage by HTTP'
+      description: |
+        Supervision d'un compte Wasabi et de tous ses buckets via la Wasabi Stats API.
+
+        Endpoints utilises :
+          GET https://stats.wasabisys.com/v1/standalone/utilizations
+          GET https://stats.wasabisys.com/v1/standalone/utilizations/buckets
+          GET https://stats.wasabisys.com/v1/standalone/utilizations/bucket/{bucket}
+
+        Authentification : header "Authorization: <AccessKey>:<SecretKey>".
+        La cle doit etre une cle ROOT ou disposer de la permission "billing".
+        Ce sont des cles Wasabi S3/IAM, PAS des cles WACM / Account Control.
+
+        IMPORTANT : la Stats API produit un enregistrement par JOUR. Les compteurs
+        (appels API, upload/download) sont des totaux journaliers, pas des compteurs
+        monotones : ne leur appliquez pas "Change per second". Un intervalle de
+        collecte de 1h est largement suffisant.
+
+        Prerequis :
+          1. Renseigner {$WASABI.ACCESS.KEY} et {$WASABI.SECRET.KEY} sur l'hote.
+          2. Le serveur ou proxy Zabbix doit joindre https://stats.wasabisys.com.
+          3. Zabbix >= 6.0 (item de type Script). Export au format 7.0.
+      vendor:
+        name: Community
+        version: 7.0-1
+      groups:
+        - name: 'Templates/Cloud'
+      items:
+        - uuid: 473b47f7589544899d1824ba5d86c411
+          name: 'Wasabi: Get utilization data'
+          type: SCRIPT
+          key: wasabi.get.utilization
+          delay: 1h
+          history: '0'
+          trends: '0'
+          value_type: TEXT
+          params: |
+            var params = JSON.parse(value);
+
+            var baseUrl = (params.base_url || 'https://stats.wasabisys.com').replace(/\/+$/, '');
+            var accessKey = params.access_key || '';
+            var secretKey = params.secret_key || '';
+            var maxPages = parseInt(params.max_pages || '20', 10);
+
+            if (accessKey === '' || accessKey.indexOf('{$') === 0) {
+                throw 'Wasabi access key is not set - fill the {$WASABI.ACCESS.KEY} macro.';
+            }
+            if (secretKey === '' || secretKey.indexOf('{$') === 0) {
+                throw 'Wasabi secret key is not set - fill the {$WASABI.SECRET.KEY} macro.';
+            }
+
+            function apiGet(path) {
+                var req = new HttpRequest();
+
+                if (params.proxy) {
+                    req.setHttpProxy(params.proxy);
+                }
+                req.addHeader('Authorization: ' + accessKey + ':' + secretKey);
+                req.addHeader('Accept: application/json');
+
+                var body = req.get(baseUrl + path);
+                var status = req.getStatus();
+
+                // 404 = endpoint not available here, let the caller fall back
+                if (status === 404) {
+                    return null;
+                }
+                if (status === 401 || status === 403) {
+                    throw 'Authentication failed (HTTP ' + status + '). The key must be a root key '
+                        + 'or carry the billing permission.';
+                }
+                if (status < 200 || status >= 300) {
+                    throw 'Request to ' + path + ' failed: HTTP ' + status + ' '
+                        + String(body).substring(0, 200);
+                }
+                try {
+                    return JSON.parse(body);
+                }
+                catch (e) {
+                    throw 'Cannot parse JSON response from ' + path;
+                }
+            }
+
+            function toEpoch(s) {
+                if (!s) {
+                    return null;
+                }
+                var t = Date.parse(s);
+                return isNaN(t) ? null : Math.floor(t / 1000);
+            }
+
+            var now = Math.floor(Date.now() / 1000);
+            var out = { account: {}, buckets: {}, discovery: [], bucket_count: 0 };
+
+            // ---------- account level ----------
+            var acct = apiGet('/v1/standalone/utilizations?latest=true&pageSize=100');
+            var arecs = (acct && acct.Records) ? acct.Records : [];
+            var best = null;
+
+            for (var i = 0; i < arecs.length; i++) {
+                if (best === null) {
+                    best = arecs[i];
+                    continue;
+                }
+                var eNew = toEpoch(arecs[i].EndTime);
+                var eOld = toEpoch(best.EndTime);
+                if (eNew !== null && (eOld === null || eNew > eOld)) {
+                    best = arecs[i];
+                }
+            }
+            if (best === null) {
+                throw 'The Stats API returned no account utilization record.';
+            }
+
+            var aEnd = toEpoch(best.EndTime);
+            best.age_seconds = (aEnd === null) ? -1 : (now - aEnd);
+            out.account = best;
+
+            // ---------- bucket level ----------
+            function collectAllBuckets() {
+                var records = [], page = 0, pageCount = 1;
+
+                while (page < pageCount && page < maxPages) {
+                    var r = apiGet('/v1/standalone/utilizations/buckets'
+                        + '?latest=true&pageSize=100&pageNum=' + page);
+                    if (r === null) {
+                        return null;
+                    }
+                    var recs = r.Records || [];
+                    for (var i = 0; i < recs.length; i++) {
+                        records.push(recs[i]);
+                    }
+                    pageCount = (r.PageInfo && r.PageInfo.PageCount) ? r.PageInfo.PageCount : 1;
+                    page++;
+                    if (recs.length === 0) {
+                        break;
+                    }
+                }
+                return records;
+            }
+
+            function collectListedBuckets() {
+                var names = String(params.buckets || '').split(',');
+                var records = [];
+
+                for (var n = 0; n < names.length; n++) {
+                    var name = names[n].replace(/^\s+|\s+$/g, '');
+                    if (name === '' || name.indexOf('{$') === 0) {
+                        continue;
+                    }
+                    var r = apiGet('/v1/standalone/utilizations/bucket/'
+                        + encodeURIComponent(name) + '?latest=true&pageSize=1');
+                    if (r && r.Records) {
+                        for (var k = 0; k < r.Records.length; k++) {
+                            records.push(r.Records[k]);
+                        }
+                    }
+                }
+                return records;
+            }
+
+            var brecs = collectAllBuckets();
+
+            if (brecs === null || brecs.length === 0) {
+                brecs = collectListedBuckets();
+                if (brecs.length === 0) {
+                    throw 'No bucket utilization returned. The /utilizations/buckets endpoint is '
+                        + 'unavailable for this account and the {$WASABI.BUCKETS} macro is empty.';
+                }
+            }
+
+            for (var j = 0; j < brecs.length; j++) {
+                var rec = brecs[j];
+                var bname = rec.Bucket;
+                if (!bname) {
+                    continue;
+                }
+                var cur = out.buckets[bname];
+                if (cur) {
+                    var eCur = toEpoch(cur.EndTime) || 0;
+                    var eRec = toEpoch(rec.EndTime) || 0;
+                    if (eCur >= eRec) {
+                        continue;
+                    }
+                }
+                var bEnd = toEpoch(rec.EndTime);
+                rec.age_seconds = (bEnd === null) ? -1 : (now - bEnd);
+                out.buckets[bname] = rec;
+            }
+
+            var keys = Object.keys(out.buckets);
+            for (var q = 0; q < keys.length; q++) {
+                out.discovery.push({
+                    '{#BUCKET}': keys[q],
+                    '{#REGION}': out.buckets[keys[q]].Region || 'unknown',
+                    '{#BUCKETNUM}': String(out.buckets[keys[q]].BucketNum || '')
+                });
+            }
+            out.bucket_count = keys.length;
+
+            return JSON.stringify(out);
+          timeout: 60s
+          parameters:
+            - name: access_key
+              value: '{$WASABI.ACCESS.KEY}'
+            - name: secret_key
+              value: '{$WASABI.SECRET.KEY}'
+            - name: base_url
+              value: '{$WASABI.API.URL}'
+            - name: buckets
+              value: '{$WASABI.BUCKETS}'
+            - name: max_pages
+              value: '{$WASABI.API.MAX_PAGES}'
+            - name: proxy
+              value: '{$WASABI.HTTP.PROXY}'
+          description: |
+            Item maitre. Interroge la Wasabi Stats API et renvoie un JSON unique
+            contenant l'utilisation du compte et la derniere utilisation de chaque
+            bucket. Tous les autres items en dependent.
+          tags:
+            - tag: component
+              value: raw
+
+        - uuid: e2ef188984c74ad0b90fc767a49b17d1
+          name: 'Wasabi: Account number'
+          type: DEPENDENT
+          key: wasabi.account.num
+          delay: '0'
+          history: 7d
+          trends: '0'
+          value_type: CHAR
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.AcctNum
+              error_handler: DISCARD_VALUE
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1d
+          tags:
+            - tag: component
+              value: account
+
+        - uuid: ab849689a1c74c539dffb9b3ec4527cc
+          name: 'Wasabi: Raw storage size'
+          type: DEPENDENT
+          key: wasabi.account.storage.raw
+          delay: '0'
+          value_type: FLOAT
+          units: B
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.RawStorageSizeBytes
+              error_handler: DISCARD_VALUE
+          description: 'Volume reel de tous les objets non supprimes (actifs et versionnes), sans arrondi.'
+          tags:
+            - tag: component
+              value: storage
+
+        - uuid: 315c2c9ea4e5431a8f6eb1999da02f79
+          name: 'Wasabi: Padded storage size (billable)'
+          type: DEPENDENT
+          key: wasabi.account.storage.padded
+          delay: '0'
+          value_type: FLOAT
+          units: B
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.PaddedStorageSizeBytes
+              error_handler: DISCARD_VALUE
+          description: 'Volume facture apres application de la taille minimale d''objet Wasabi (4 KB).'
+          tags:
+            - tag: component
+              value: storage
+
+        - uuid: 1c15dd6f78424e8194720ab2d68dc6f5
+          name: 'Wasabi: Metadata storage size'
+          type: DEPENDENT
+          key: wasabi.account.storage.metadata
+          delay: '0'
+          value_type: FLOAT
+          units: B
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.MetadataStorageSizeBytes
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: storage
+
+        - uuid: 7836c19b36b44b6ea0509320416b237e
+          name: 'Wasabi: Deleted storage size'
+          type: DEPENDENT
+          key: wasabi.account.storage.deleted
+          delay: '0'
+          value_type: FLOAT
+          units: B
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.DeletedStorageSizeBytes
+              error_handler: DISCARD_VALUE
+          description: |
+            Volume d'objets supprimes encore facture au titre de la retention
+            minimale de 90 jours (Timed Deleted Storage).
+          tags:
+            - tag: component
+              value: storage
+
+        - uuid: dbf0c681a6ed430196a4b768eab78290
+          name: 'Wasabi: Orphaned storage size'
+          type: DEPENDENT
+          key: wasabi.account.storage.orphaned
+          delay: '0'
+          value_type: FLOAT
+          units: B
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.OrphanedStorageSizeBytes
+              error_handler: DISCARD_VALUE
+          description: 'Fragments d''uploads multipart non termines. A nettoyer via une regle de lifecycle.'
+          tags:
+            - tag: component
+              value: storage
+
+        - uuid: c7b18590e4254e0c9ed44d77f2ce5d03
+          name: 'Wasabi: Minimum storage charge'
+          type: DEPENDENT
+          key: wasabi.account.storage.min_charge
+          delay: '0'
+          value_type: FLOAT
+          units: B
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.MinStorageChargeBytes
+              error_handler: DISCARD_VALUE
+          description: 'Volume facture mais non utilise, du au minimum de 1 To.'
+          tags:
+            - tag: component
+              value: billing
+
+        - uuid: 21b8989d194f4f149ac31acaf678e207
+          name: 'Wasabi: Billable objects'
+          type: DEPENDENT
+          key: wasabi.account.objects.billable
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.NumBillableObjects
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: objects
+
+        - uuid: 5758962dede54c68b4f5f47dcd28382f
+          name: 'Wasabi: Billable deleted objects'
+          type: DEPENDENT
+          key: wasabi.account.objects.deleted
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.NumBillableDeletedObjects
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: objects
+
+        - uuid: 8677eb6d7afa4d13a90d5341db5ee8d1
+          name: 'Wasabi: API calls per day, total'
+          type: DEPENDENT
+          key: wasabi.account.api.calls
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.NumAPICalls
+              error_handler: DISCARD_VALUE
+          description: 'Total journalier, PAS un compteur monotone.'
+          tags:
+            - tag: component
+              value: api
+
+        - uuid: 9cc5a2f77d624684a69355cf29a7e3fa
+          name: 'Wasabi: API calls per day, GET'
+          type: DEPENDENT
+          key: wasabi.account.api.get
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.NumGETCalls
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: api
+
+        - uuid: ce1eaf00766f402bbee98e81af56a949
+          name: 'Wasabi: API calls per day, PUT'
+          type: DEPENDENT
+          key: wasabi.account.api.put
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.NumPUTCalls
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: api
+
+        - uuid: a1e845e9878d411b8e914f82cd0446f8
+          name: 'Wasabi: API calls per day, DELETE'
+          type: DEPENDENT
+          key: wasabi.account.api.delete
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.NumDELETECalls
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: api
+
+        - uuid: a6d152d9a7ac4ce39a3d5ce347885ae7
+          name: 'Wasabi: API calls per day, LIST'
+          type: DEPENDENT
+          key: wasabi.account.api.list
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.NumLISTCalls
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: api
+
+        - uuid: 55607ccca3e247288d2140502cfb2262
+          name: 'Wasabi: API calls per day, HEAD'
+          type: DEPENDENT
+          key: wasabi.account.api.head
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.NumHEADCalls
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: api
+
+        - uuid: 7ec20835424f464284d948b481504bda
+          name: 'Wasabi: Ingress per day'
+          type: DEPENDENT
+          key: wasabi.account.upload_bytes
+          delay: '0'
+          value_type: FLOAT
+          units: B
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.UploadBytes
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: network
+
+        - uuid: 7c8c9c7583c14599b8d787c7281a987f
+          name: 'Wasabi: Egress per day'
+          type: DEPENDENT
+          key: wasabi.account.download_bytes
+          delay: '0'
+          value_type: FLOAT
+          units: B
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.DownloadBytes
+              error_handler: DISCARD_VALUE
+          description: 'Egress journalier. Sert au controle de la politique d''usage raisonnable Wasabi.'
+          tags:
+            - tag: component
+              value: network
+
+        - uuid: 06fe94fbaa364fb4bc65cae9d3ed8d83
+          name: 'Wasabi: Utilization data age'
+          type: DEPENDENT
+          key: wasabi.account.data_age
+          delay: '0'
+          value_type: FLOAT
+          units: s
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.account.age_seconds
+              error_handler: DISCARD_VALUE
+          description: |
+            Age du dernier enregistrement d'utilisation (now - EndTime).
+            Wasabi genere un enregistrement par jour : une valeur superieure a 48h
+            signale un probleme cote Wasabi ou une cle sans permission de facturation.
+          tags:
+            - tag: component
+              value: health
+
+        - uuid: 60383920981343a7bd7b45eb78421d52
+          name: 'Wasabi: Number of buckets'
+          type: DEPENDENT
+          key: wasabi.buckets.count
+          delay: '0'
+          value_type: FLOAT
+          master_item:
+            key: wasabi.get.utilization
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.bucket_count
+              error_handler: DISCARD_VALUE
+          tags:
+            - tag: component
+              value: buckets
+
+        - uuid: 7f6757c8fa694558a3abdd90bd730dcf
+          name: 'Wasabi: Deleted storage ratio'
+          type: CALCULATED
+          key: wasabi.account.storage.deleted.pct
+          delay: 1h
+          value_type: FLOAT
+          units: '%'
+          params: '100*last(//wasabi.account.storage.deleted)/(last(//wasabi.account.storage.raw)+1)'
+          description: |
+            Part du stockage facture correspondant a des objets deja supprimes mais
+            encore soumis a la retention minimale de 90 jours.
+          tags:
+            - tag: component
+              value: billing
+
+        - uuid: 33039be2897d4e47b6fd70004cfbaf3c
+          name: 'Wasabi: Egress, 30d'
+          type: CALCULATED
+          key: wasabi.account.egress.30d
+          delay: 1h
+          value_type: FLOAT
+          units: B
+          params: 'sum(//wasabi.account.download_bytes,30d)'
+          description: |
+            Egress cumule sur 30 jours. La politique d'usage raisonnable Wasabi
+            attend un egress mensuel inferieur ou egal au volume stocke.
+          tags:
+            - tag: component
+              value: network
+
+      discovery_rules:
+        - uuid: eca6b231d5fa4e649df688199dcc871a
+          name: 'Wasabi: Bucket discovery'
+          type: DEPENDENT
+          key: wasabi.buckets.discovery
+          delay: '0'
+          filter:
+            evaltype: AND
+            conditions:
+              - macro: '{#BUCKET}'
+                value: '{$WASABI.BUCKET.MATCHES}'
+                formulaid: A
+              - macro: '{#BUCKET}'
+                value: '{$WASABI.BUCKET.NOT_MATCHES}'
+                operator: NOT_MATCHES_REGEX
+                formulaid: B
+          lifetime: 7d
+          master_item:
+            key: wasabi.get.utilization
+          description: 'Decouvre tous les buckets remontes par la Stats API.'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.discovery
+          item_prototypes:
+            - uuid: 81a1a78bf35f485a8ae5b0dc731eec43
+              name: 'Wasabi bucket [{#BUCKET}]: Raw storage size'
+              type: DEPENDENT
+              key: 'wasabi.bucket.storage.raw["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].RawStorageSizeBytes
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: storage
+
+            - uuid: 0e65d254a446482e910f78ecc4a15b78
+              name: 'Wasabi bucket [{#BUCKET}]: Padded storage size (billable)'
+              type: DEPENDENT
+              key: 'wasabi.bucket.storage.padded["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].PaddedStorageSizeBytes
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: storage
+
+            - uuid: b5e1a43938754ec0a43ca36291768e5c
+              name: 'Wasabi bucket [{#BUCKET}]: Metadata storage size'
+              type: DEPENDENT
+              key: 'wasabi.bucket.storage.metadata["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].MetadataStorageSizeBytes
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: storage
+
+            - uuid: a103cc1d04024bf0a0a29c8ba4f9bef4
+              name: 'Wasabi bucket [{#BUCKET}]: Deleted storage size'
+              type: DEPENDENT
+              key: 'wasabi.bucket.storage.deleted["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].DeletedStorageSizeBytes
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: storage
+
+            - uuid: df0a09644d5d413bb8767095bdd2849f
+              name: 'Wasabi bucket [{#BUCKET}]: Billable objects'
+              type: DEPENDENT
+              key: 'wasabi.bucket.objects.billable["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].NumBillableObjects
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: objects
+
+            - uuid: 43256c2ac2d74b108f3d22b669f79c08
+              name: 'Wasabi bucket [{#BUCKET}]: Billable deleted objects'
+              type: DEPENDENT
+              key: 'wasabi.bucket.objects.deleted["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].NumBillableDeletedObjects
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: objects
+
+            - uuid: 2d5785f2de554acdbeb04c007095ee2c
+              name: 'Wasabi bucket [{#BUCKET}]: API calls per day, total'
+              type: DEPENDENT
+              key: 'wasabi.bucket.api.calls["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].NumAPICalls
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: api
+
+            - uuid: a7627e6c696742a68d5c7650b5ccbc70
+              name: 'Wasabi bucket [{#BUCKET}]: API calls per day, GET'
+              type: DEPENDENT
+              key: 'wasabi.bucket.api.get["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].NumGETCalls
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: api
+
+            - uuid: 84640f13582a4c02880dd233e956201d
+              name: 'Wasabi bucket [{#BUCKET}]: API calls per day, PUT'
+              type: DEPENDENT
+              key: 'wasabi.bucket.api.put["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].NumPUTCalls
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: api
+
+            - uuid: 412a7f52a828476da5b3100f424e107c
+              name: 'Wasabi bucket [{#BUCKET}]: API calls per day, DELETE'
+              type: DEPENDENT
+              key: 'wasabi.bucket.api.delete["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].NumDELETECalls
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: api
+
+            - uuid: 200a5f1c27b542a78259d8013fe318d9
+              name: 'Wasabi bucket [{#BUCKET}]: API calls per day, LIST'
+              type: DEPENDENT
+              key: 'wasabi.bucket.api.list["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].NumLISTCalls
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: api
+
+            - uuid: fa70e8cf4cb04e02a62feae19c9f98ff
+              name: 'Wasabi bucket [{#BUCKET}]: API calls per day, HEAD'
+              type: DEPENDENT
+              key: 'wasabi.bucket.api.head["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].NumHEADCalls
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: api
+
+            - uuid: 51deaa7269364a68aaa0079f51a79dca
+              name: 'Wasabi bucket [{#BUCKET}]: Ingress per day'
+              type: DEPENDENT
+              key: 'wasabi.bucket.upload_bytes["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].UploadBytes
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: network
+
+            - uuid: f95ca1c3ea584b97ab8678babddf13a4
+              name: 'Wasabi bucket [{#BUCKET}]: Egress per day'
+              type: DEPENDENT
+              key: 'wasabi.bucket.download_bytes["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: B
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].DownloadBytes
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: network
+
+            - uuid: e505d29a2a5d49ad868a2ee231acb5c2
+              name: 'Wasabi bucket [{#BUCKET}]: Utilization data age'
+              type: DEPENDENT
+              key: 'wasabi.bucket.data_age["{#BUCKET}"]'
+              delay: '0'
+              value_type: FLOAT
+              units: s
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].age_seconds
+                  error_handler: DISCARD_VALUE
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: health
+
+            - uuid: 5daf1b878980449cb4a61468bc7b5971
+              name: 'Wasabi bucket [{#BUCKET}]: Region'
+              type: DEPENDENT
+              key: 'wasabi.bucket.region["{#BUCKET}"]'
+              delay: '0'
+              history: 7d
+              trends: '0'
+              value_type: CHAR
+              master_item:
+                key: wasabi.get.utilization
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - $.buckets['{#BUCKET}'].Region
+                  error_handler: DISCARD_VALUE
+                - type: DISCARD_UNCHANGED_HEARTBEAT
+                  parameters:
+                    - 1d
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: component
+                  value: buckets
+
+          trigger_prototypes:
+            - uuid: c6b7e832445e4f81bd856951eeb7309a
+              expression: 'last(/Wasabi Cloud Storage by HTTP/wasabi.bucket.storage.raw["{#BUCKET}"])>{$WASABI.BUCKET.STORAGE.MAX:"{#BUCKET}"}'
+              name: 'Wasabi bucket [{#BUCKET}]: Storage size is too high'
+              priority: WARNING
+              description: |
+                Seuil surchargeable par bucket via un contexte de macro :
+                {$WASABI.BUCKET.STORAGE.MAX:"nom-du-bucket"} = 5T
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: scope
+                  value: capacity
+
+            - uuid: d3c7f39cdf0545139d7d6cd44a835f71
+              expression: 'change(/Wasabi Cloud Storage by HTTP/wasabi.bucket.storage.raw["{#BUCKET}"])<0 and abs(change(/Wasabi Cloud Storage by HTTP/wasabi.bucket.storage.raw["{#BUCKET}"]))>last(/Wasabi Cloud Storage by HTTP/wasabi.bucket.storage.raw["{#BUCKET}"],#2)*{$WASABI.BUCKET.DROP.PCT}/100'
+              name: 'Wasabi bucket [{#BUCKET}]: Storage size dropped by more than {$WASABI.BUCKET.DROP.PCT}%'
+              priority: AVERAGE
+              manual_close: 'YES'
+              description: |
+                Chute brutale du volume stocke : suppression massive, expiration de
+                lifecycle inattendue ou compromission. A verifier.
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: scope
+                  value: security
+
+            - uuid: f781a74c16d74f048e1f26f5e73c88c4
+              expression: 'last(/Wasabi Cloud Storage by HTTP/wasabi.bucket.data_age["{#BUCKET}"])>{$WASABI.DATA.MAX_AGE}'
+              name: 'Wasabi bucket [{#BUCKET}]: Utilization data is stale'
+              priority: WARNING
+              description: 'Aucun nouvel enregistrement d''utilisation depuis {$WASABI.DATA.MAX_AGE}.'
+              tags:
+                - tag: bucket
+                  value: '{#BUCKET}'
+                - tag: scope
+                  value: availability
+
+          graph_prototypes:
+            - uuid: 9dfa577e2eb544249ac5791e2b67def9
+              name: 'Wasabi bucket [{#BUCKET}]: Storage'
+              graph_items:
+                - color: 1A7C11
+                  item:
+                    host: 'Wasabi Cloud Storage by HTTP'
+                    key: 'wasabi.bucket.storage.raw["{#BUCKET}"]'
+                - sortorder: '1'
+                  color: 2774A4
+                  item:
+                    host: 'Wasabi Cloud Storage by HTTP'
+                    key: 'wasabi.bucket.storage.padded["{#BUCKET}"]'
+                - sortorder: '2'
+                  color: F63100
+                  item:
+                    host: 'Wasabi Cloud Storage by HTTP'
+                    key: 'wasabi.bucket.storage.deleted["{#BUCKET}"]'
+
+      tags:
+        - tag: class
+          value: cloud
+        - tag: target
+          value: wasabi
+
+      macros:
+        - macro: '{$WASABI.ACCESS.KEY}'
+          description: 'Wasabi access key ID (cle ROOT ou avec permission billing).'
+        - macro: '{$WASABI.SECRET.KEY}'
+          type: SECRET_TEXT
+          description: 'Wasabi secret access key.'
+        - macro: '{$WASABI.API.URL}'
+          value: 'https://stats.wasabisys.com'
+          description: 'URL de base de la Wasabi Stats API.'
+        - macro: '{$WASABI.API.MAX_PAGES}'
+          value: '20'
+          description: 'Nombre maximal de pages (100 buckets par page) parcourues par collecte.'
+        - macro: '{$WASABI.BUCKETS}'
+          value: ''
+          description: |
+            Liste de buckets separes par des virgules. Utilisee UNIQUEMENT en repli si
+            l'endpoint /v1/standalone/utilizations/buckets n'est pas disponible sur le compte.
+        - macro: '{$WASABI.HTTP.PROXY}'
+          value: ''
+          description: 'Proxy HTTP sortant, ex. http://proxy.local:3128. Vide = pas de proxy.'
+        - macro: '{$WASABI.BUCKET.MATCHES}'
+          value: '.*'
+          description: 'LLD : ne decouvrir que les buckets dont le nom correspond a cette regexp.'
+        - macro: '{$WASABI.BUCKET.NOT_MATCHES}'
+          value: 'CHANGE_IF_NEEDED'
+          description: 'LLD : ignorer les buckets dont le nom correspond a cette regexp.'
+        - macro: '{$WASABI.BUCKET.STORAGE.MAX}'
+          value: 10T
+          description: 'Seuil d''alerte de volume par bucket. Surchargeable par contexte.'
+        - macro: '{$WASABI.BUCKET.DROP.PCT}'
+          value: '20'
+          description: 'Pourcentage de chute de volume d''un bucket declenchant une alerte.'
+        - macro: '{$WASABI.STORAGE.MAX}'
+          value: 100T
+          description: 'Seuil d''alerte de volume facture pour l''ensemble du compte.'
+        - macro: '{$WASABI.DELETED.RATIO.MAX}'
+          value: '25'
+          description: 'Part maximale acceptable de stockage supprime encore facture (%).'
+        - macro: '{$WASABI.DATA.MAX_AGE}'
+          value: 48h
+          description: 'Age maximal d''un enregistrement d''utilisation avant alerte.'
+
+  triggers:
+    - uuid: 5a136975c0834b0fa1ca213694e792c0
+      expression: 'nodata(/Wasabi Cloud Storage by HTTP/wasabi.get.utilization,3h)=1'
+      name: 'Wasabi: Failed to get data from the Stats API'
+      priority: AVERAGE
+      description: |
+        Aucune donnee recuperee depuis 3h. Verifier :
+        - les macros {$WASABI.ACCESS.KEY} et {$WASABI.SECRET.KEY} ;
+        - que la cle est une cle ROOT ou possede la permission billing ;
+        - la joignabilite de https://stats.wasabisys.com depuis le serveur ou proxy Zabbix ;
+        - l'erreur exacte dans Latest data, item "Wasabi: Get utilization data".
+      tags:
+        - tag: scope
+          value: availability
+
+    - uuid: 2b3ab98ed3914dfbb8a63ed75c7a739c
+      expression: 'last(/Wasabi Cloud Storage by HTTP/wasabi.account.data_age)>{$WASABI.DATA.MAX_AGE}'
+      name: 'Wasabi: Account utilization data is stale'
+      priority: WARNING
+      description: 'Wasabi n''a produit aucun nouvel enregistrement d''utilisation depuis {$WASABI.DATA.MAX_AGE}.'
+      tags:
+        - tag: scope
+          value: availability
+
+    - uuid: 174403fbdf8944bc92c927f79f909926
+      expression: 'last(/Wasabi Cloud Storage by HTTP/wasabi.account.storage.padded)>{$WASABI.STORAGE.MAX}'
+      name: 'Wasabi: Billable storage is too high'
+      priority: WARNING
+      tags:
+        - tag: scope
+          value: capacity
+
+    - uuid: aa01e65ed7d940378c2314e9f976a049
+      expression: 'last(/Wasabi Cloud Storage by HTTP/wasabi.account.storage.min_charge)>0'
+      name: 'Wasabi: Billed for unused capacity (below the 1 TB minimum)'
+      priority: INFO
+      description: |
+        Le compte stocke moins que le minimum facturable de 1 To : une partie de la
+        facture correspond a de la capacite non utilisee.
+      tags:
+        - tag: scope
+          value: cost
+
+    - uuid: 3d243c987f0f4a4b8e73027a7bcf96e4
+      expression: 'min(/Wasabi Cloud Storage by HTTP/wasabi.account.storage.deleted.pct,1d)>{$WASABI.DELETED.RATIO.MAX}'
+      name: 'Wasabi: More than {$WASABI.DELETED.RATIO.MAX}% of billed storage is deleted data'
+      priority: WARNING
+      description: |
+        Une part importante de la facture correspond a des objets supprimes encore
+        soumis a la retention minimale de 90 jours. Revoir les regles de lifecycle
+        et la frequence des suppressions/reecritures.
+      tags:
+        - tag: scope
+          value: cost
+
+    - uuid: 88f0a23a81ed4940a48548c96a96ae5b
+      expression: 'last(/Wasabi Cloud Storage by HTTP/wasabi.account.egress.30d)>last(/Wasabi Cloud Storage by HTTP/wasabi.account.storage.padded)'
+      name: 'Wasabi: 30d egress exceeds stored volume (fair use policy)'
+      priority: WARNING
+      description: |
+        L'egress cumule sur 30 jours depasse le volume stocke. La politique d'usage
+        raisonnable de Wasabi attend un ratio inferieur ou egal a 1.
+      tags:
+        - tag: scope
+          value: cost

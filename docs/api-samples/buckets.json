@@ -1,0 +1,49 @@
+{
+  "success": true,
+  "code": null,
+  "message": "Successfully read!",
+  "data": {
+    "items": [
+      {
+        "id": 219000000,
+        "startTime": "2026-09-09",
+        "endTime": "2026-09-10",
+        "activeStorage": 0,
+        "deletedStorage": 0.05800772577,
+        "storageWrote": 0,
+        "storageRead": 0,
+        "activeObjects": 0,
+        "deletedObjects": 2503,
+        "egress": 0,
+        "ingress": 0,
+        "apiCalls": 0,
+        "name": "example-backup",
+        "region": "us-east-1",
+        "bucketNumber": 3800000,
+        "bucketDeleteTime": "2026-08-14"
+      },
+      {
+        "id": 219000001,
+        "startTime": "2026-09-09",
+        "endTime": "2026-09-10",
+        "activeStorage": 1.50691013766,
+        "deletedStorage": 1.017e-06,
+        "storageWrote": 0,
+        "storageRead": 0,
+        "activeObjects": 64099,
+        "deletedObjects": 261,
+        "egress": 0,
+        "ingress": 0,
+        "apiCalls": 0,
+        "name": "example-archive-deleted",
+        "region": "eu-west-2",
+        "bucketNumber": 3800001,
+        "bucketDeleteTime": null
+      }
+    ],
+    "page": 0,
+    "size": 100,
+    "total": 2
+  },
+  "errors": null
+}
